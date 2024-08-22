@@ -80,11 +80,42 @@ echo -e "${GREEN}${BOLD}Request faucet to your wallet from this link:${RESET} ht
 echo
 
 echo -e "${BOLD}${UNDERLINE}${DARK_YELLOW}Installing worker node...${RESET}"
-git clone https://github.com/allora-network/basic-coin-prediction-node
-cd basic-coin-prediction-node
+if [ ! -d "/root/basic-coin-prediction-node" ]; then
+    git clone https://github.com/allora-network/basic-coin-prediction-node /root/basic-coin-prediction-node
+fi
+cd /root/basic-coin-prediction-node || exit
 echo
+
 read -p "Enter WALLET_SEED_PHRASE: " WALLET_SEED_PHRASE
 echo
+
+echo -e "${BOLD}${DARK_YELLOW}Select an RPC server or enter a custom one:${RESET}"
+echo "1) https://rpc.ankr.com/allora_testnet"
+echo "2) https://allora-rpc.testnet-1.testnet.allora.network/"
+echo "3) https://beta.multi-rpc.com/allora_testnet/"
+echo "4) https://allora-testnet-1-rpc.testnet.nodium.xyz/"
+echo "5) Enter custom RPC"
+read -p "Enter your choice (1-5): " rpc_choice
+
+case $rpc_choice in
+    1) RPC_URL="https://rpc.ankr.com/allora_testnet" ;;
+    2) RPC_URL="https://allora-rpc.testnet-1.testnet.allora.network/" ;;
+    3) RPC_URL="https://beta.multi-rpc.com/allora_testnet/" ;;
+    4) RPC_URL="https://allora-testnet-1-rpc.testnet.nodium.xyz/" ;;
+    5)
+        read -p "Enter custom RPC URL: " RPC_URL
+        # Basic URL validation
+        if [[ ! $RPC_URL =~ ^https?:// ]]; then
+            echo "Invalid URL. Please enter a valid URL starting with http:// or https://"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Invalid choice. Exiting."
+        exit 1
+        ;;
+esac
+
 echo -e "${BOLD}${UNDERLINE}${DARK_YELLOW}Generating config.json file...${RESET}"
 cat <<EOF > config.json
 {
@@ -94,7 +125,7 @@ cat <<EOF > config.json
     "alloraHomeDir": "",
     "gas": "1000000",
     "gasAdjustment": 1.0,
-    "nodeRpc": "https://sentries-rpc.testnet-1.testnet.allora.network/",
+    "nodeRpc": "$RPC_URL",
     "maxRetries": 1,
     "delay": 1,
     "submitTx": true
@@ -105,16 +136,7 @@ cat <<EOF > config.json
       "inferenceEntrypointName": "api-worker-reputer",
       "loopSeconds": 5,
       "parameters": {
-        "InferenceEndpoint": "http://localhost:8000/inference/{Token}",
-        "Token": "ETH"
-      }
-    },
-    {
-      "topicId": 1,
-      "inferenceEntrypointName": "api-worker-reputer",
-      "loopSeconds": 5,
-      "parameters": {
-        "InferenceEndpoint": "http://localhost:8000/inference/{Token}",
+        "InferenceEndpoint": "http://inference:8000/inference/{Token}",
         "Token": "ETH"
       }
     }
@@ -129,14 +151,101 @@ chmod +x init.config
 sleep 2
 ./init.config
 
-echo
+
+# Create updater script in root directory
+cat <<EOF > /root/allora_updater.sh
+#!/bin/bash
+
+# Directory of your repository
+REPO_DIR=/root/basic-coin-prediction-node
+
+# Change to the repository directory
+cd \$REPO_DIR
+
+# Function to log messages
+log_message() {
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1" >> /var/log/allora_updater.log
+}
+
+# Fetch the latest changes from the remote repository
+git fetch
+
+# Check if there are new changes in the main branch
+LOCAL=\$(git rev-parse HEAD)
+REMOTE=\$(git rev-parse @{u})
+
+if [ \$LOCAL != \$REMOTE ]; then
+    log_message "Updates found. Pulling changes and restarting services..."
+
+    # Pull the latest changes
+    if git pull; then
+        log_message "Git pull successful."
+
+        # Update config.json if necessary
+        if [ -f config.json ]; then
+            # Backup the existing config
+            cp config.json config.json.bak
+
+            # Update the config file (you may need to adjust this part based on what needs to be updated)
+            # For example, updating the RPC URL:
+            # sed -i 's#"nodeRpc": ".*"#"nodeRpc": "https://new-rpc-url.com"#' config.json
+
+            log_message "config.json updated."
+        else
+            log_message "config.json not found. Skipping config update."
+        fi
+
+        # Stop and restart the Docker containers with the new changes
+        if docker compose down && docker compose up -d; then
+            log_message "Docker containers restarted successfully."
+        else
+            log_message "Error restarting Docker containers."
+        fi
+
+        log_message "Update completed and services restarted."
+    else
+        log_message "Error pulling changes from git."
+    fi
+else
+    log_message "No updates found. Everything is up to date."
+fi
+EOF
+
+chmod +x /root/allora_updater.sh
+
+# Set up cron job to run the updater script every hour
+(crontab -l 2>/dev/null; echo "0 * * * * /root/allora_updater.sh") | crontab -
+
+# Set up autostart for the updater script
+cat <<EOF > /etc/systemd/system/allora-updater.service
+[Unit]
+Description=Allora Worker Node Updater
+After=network.target
+
+[Service]
+ExecStart=/root/allora_updater.sh
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable allora-updater.service
+systemctl start allora-updater.service
+
+echo -e "${BOLD}${DARK_YELLOW}Updater script created in /root and configured to run every hour and on system startup.${RESET}"
+
 echo -e "${BOLD}${UNDERLINE}${DARK_YELLOW}Building and starting Docker containers...${RESET}"
-docker compose build
-docker-compose up -d
+execute_with_prompt "docker compose build"
+execute_with_prompt "docker compose up -d"
 echo
-sleep 2
+
 echo -e "${BOLD}${DARK_YELLOW}Checking running Docker containers...${RESET}"
-docker ps
+execute_with_prompt "docker ps"
 echo
-execute_with_prompt 'docker logs -f worker'
-echo
+
+echo -e "${BOLD}${DARK_YELLOW}Showing logs from the worker container...${RESET}"
+execute_with_prompt "docker logs -f worker"
+
+echo -e "${BOLD}${DARK_YELLOW}Installation completed successfully!${RESET}"
